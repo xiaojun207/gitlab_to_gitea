@@ -15,6 +15,9 @@ import pygitea # pip install pygitea (https://github.com/h44z/pygitea)
 
 SCRIPT_VERSION = "1.0"
 GLOBAL_ERROR_COUNT = 0
+GLOBAL_PROJECT_COUNT = 0
+GLOBAL_REPO_EXISTS_COUNT = 0
+UPDATE_PROJECT = False
 
 #######################
 # CONFIG SECTION START
@@ -39,7 +42,7 @@ def main():
     print()
 
     # private token or personal token authentication
-    gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN)
+    gl = gitlab.Gitlab(GITLAB_URL, ssl_verify=False, private_token=GITLAB_TOKEN)
     gl.auth()
     assert(isinstance(gl.user, gitlab.v4.objects.CurrentUser))
     print_info("Connected to Gitlab, version: " + str(gl.version()))
@@ -59,6 +62,8 @@ def main():
         print_success("Migration finished with no errors!")
     else:
         print_error("Migration finished with " + str(GLOBAL_ERROR_COUNT) + " errors!")
+
+    print_success("Project Count: " + str(GLOBAL_PROJECT_COUNT) + "，exists：" + str(GLOBAL_REPO_EXISTS_COUNT))
 
 
 # 
@@ -136,17 +141,17 @@ def get_collaborators(gitea_api: pygitea, owner: string, repo: string) -> []:
 
 def get_user_or_group(gitea_api: pygitea, project: gitlab.v4.objects.Project) -> {}:
     result = None
-    response: requests.Response = gitea_api.get("/users/" + name_clean(project.namespace['path']))
+    response: requests.Response = gitea_api.get("/users/" + get_name_space(project.namespace['full_path']))
     if response.ok:
         result = response.json()
 
     # The api may return a 200 response, even if it's not a user but an org, let's try again!
     if result is None or result["id"] == 0:
-        response: requests.Response = gitea_api.get("/orgs/" + name_clean(project.namespace["name"]))
+        response: requests.Response = gitea_api.get("/orgs/" + get_name_space(project.namespace["full_path"]))
         if response.ok:
             result = response.json()
         else:
-            print_error("Failed to load user or group " + name_clean(project.namespace["name"]) + "! " + response.text)
+            print_error("Failed to load user or group " + get_name_space(project.namespace["full_path"]) + "! " + response.text)
 
     return result
 
@@ -227,6 +232,8 @@ def collaborator_exists(gitea_api: pygitea, owner: string, repo: string, usernam
 def repo_exists(gitea_api: pygitea, owner: string, repo: string) -> bool:
     repo_response: requests.Response = gitea_api.get("/repos/" + owner + "/" + repo)
     if repo_response.ok:
+        global GLOBAL_REPO_EXISTS_COUNT
+        GLOBAL_REPO_EXISTS_COUNT += 1
         print_warning("Project " + repo + " does already exist in Gitea, skipping!")
     else:
         print("Project " + repo + " not found in Gitea, importing!")
@@ -381,10 +388,27 @@ def _import_project_issues(gitea_api: pygitea, issues: [gitlab.v4.objects.Projec
 
 
 def _import_project_repo(gitea_api: pygitea, project: gitlab.v4.objects.Project):
-    if not repo_exists(gitea_api, name_clean(project.namespace['name']), name_clean(project.name)):
+    global GLOBAL_PROJECT_COUNT
+    global UPDATE_PROJECT
+    GLOBAL_PROJECT_COUNT += 1
+
+    name_space = get_name_space(project.namespace['full_path'])
+
+    is_repo_exists = repo_exists(gitea_api, name_space, name_clean(project.path))
+
+    if UPDATE_PROJECT and is_repo_exists:
+        url = "/repos/" + name_space + "/" + name_clean(project.path)
+        import_response: requests.Response = gitea_api.delete(url)
+        if import_response.ok:
+            is_repo_exists = False
+            print_info("Project " + name_clean(project.path) + " delete!")
+        else:
+            print_error("Project " + name_clean(project.path) + " delete failed: " + import_response.text)
+
+    if not is_repo_exists:
         clone_url = project.http_url_to_repo
-        if GITLAB_ADMIN_PASS == '' and GITLAB_ADMIN_USER == '':
-            clone_url = project.ssh_url_to_repo
+        # if GITLAB_ADMIN_PASS == '' and GITLAB_ADMIN_USER == '':
+        #     clone_url = project.ssh_url_to_repo
         private = project.visibility == 'private' or project.visibility == 'internal'
 
         # Load the owner (users and groups can both be fetched using the /users/ endpoint)
@@ -394,30 +418,31 @@ def _import_project_repo(gitea_api: pygitea, project: gitlab.v4.objects.Project)
 
             if description is not None and len(description) > 255:
                 description = description[:255]
-                print_warning(f"Description of {name_clean(project.name)} had to be truncated to 255 characters!")
+                print_warning(f"Description of {name_clean(project.path)} had to be truncated to 255 characters!")
 
             import_response: requests.Response = gitea_api.post("/repos/migrate", json={
-                "auth_password": GITLAB_ADMIN_PASS,
-                "auth_username": GITLAB_ADMIN_USER,
+                # "auth_password": GITLAB_ADMIN_PASS,
+                # "auth_username": GITLAB_ADMIN_USER,
+                "auth_token": GITLAB_TOKEN,
                 "clone_addr": clone_url,
                 "description": description,
                 "mirror": False,
                 "private": private,
-                "repo_name": name_clean(project.name),
+                "repo_name": name_clean(project.path),
                 "uid": owner['id']
             })
             if import_response.ok:
-                print_info("Project " + name_clean(project.name) + " imported!")
+                print_info("Project " + name_clean(project.path) + " imported!")
             else:
-                print_error("Project " + name_clean(project.name) + " import failed: " + import_response.text)
+                print_error("Project " + name_clean(project.path) + " import failed: " + import_response.text)
         else:
-            print_error("Failed to load project owner for project " + name_clean(project.name))
+            print_error("Failed to load project owner for project " + name_clean(project.path))
 
 
 def _import_project_repo_collaborators(gitea_api: pygitea, collaborators: [gitlab.v4.objects.ProjectMember], project: gitlab.v4.objects.Project):
     for collaborator in collaborators:
         
-        if not collaborator_exists(gitea_api, name_clean(project.namespace['name']), name_clean(project.name), collaborator.username):
+        if not collaborator_exists(gitea_api, get_name_space(project.namespace['full_path']), name_clean(project.path), collaborator.username):
             permission = "read"
             
             if collaborator.access_level == 10:    # guest access
@@ -434,7 +459,7 @@ def _import_project_repo_collaborators(gitea_api: pygitea, collaborators: [gitla
             else:
                 print_warning("Unsupported access level " + str(collaborator.access_level) + ", setting permissions to 'read'!")
             
-            import_response: requests.Response = gitea_api.put("/repos/" + name_clean(project.namespace['name']) +"/" + name_clean(project.name) + "/collaborators/" + collaborator.username, json={
+            import_response: requests.Response = gitea_api.put("/repos/" + get_name_space(project.namespace['full_path']) +"/" + name_clean(project.path) + "/collaborators/" + collaborator.username, json={
                 "permission": permission
             })
             if import_response.ok:
@@ -444,10 +469,12 @@ def _import_project_repo_collaborators(gitea_api: pygitea, collaborators: [gitla
 
 
 def _import_users(gitea_api: pygitea, users: [gitlab.v4.objects.User], notify: bool = False):
+    idx = 0
+    count = len(users)
     for user in users:
         keys: [gitlab.v4.objects.UserKey] = user.keys.list(all=True)
-
-        print("Importing user " + user.username + "...")
+        idx += 1
+        print(str(idx) + "/" + str(count) + "\t Importing user " + user.username + "...")
         print("Found " + str(len(keys)) + " public keys for user " + user.username)
 
         if not user_exists(gitea_api, user.username):
@@ -490,24 +517,29 @@ def _import_user_keys(gitea_api: pygitea, keys: [gitlab.v4.objects.UserKey], use
 
 
 def _import_groups(gitea_api: pygitea, groups: [gitlab.v4.objects.Group]):
+    idx = 0
+    count = len(groups)
+    print_info("Group Count:" + str(len(groups)) + "")
     for group in groups:
         members: [gitlab.v4.objects.GroupMember] = group.members.list(all=True)
 
-        print("Importing group " + name_clean(group.name) + "...")
-        print("Found " + str(len(members)) + " gitlab members for group " + name_clean(group.name))
+        idx += 1
+        print(str(idx) + "/" + str(count) + "\t Importing group " + get_name_space(group.full_path) + "...")
+        print("Found " + str(len(members)) + " gitlab members for group " + get_name_space(group.full_path))
 
-        if not organization_exists(gitea_api, name_clean(group.name)):
+        if not organization_exists(gitea_api, get_name_space(group.full_path)):
             import_response: requests.Response = gitea_api.post("/orgs", json={
                 "description": group.description,
-                "full_name": group.full_name,
+                "full_name": group.full_path,
                 "location": "",
-                "username": name_clean(group.name),
-                "website": ""
+                "username": get_name_space(group.full_path),
+                "website": "",
+                "visibility": group.visibility,
             })
             if import_response.ok:
-                print_info("Group " + name_clean(group.name) + " imported!")
+                print_info("Group " + get_name_space(group.full_path) + " imported!")
             else:
-                print_error("Group " + name_clean(group.name) + " import failed: " + import_response.text)
+                print_error("Group " + get_name_space(group.full_path) + " import failed: " + import_response.text)
 
         # import group members
         _import_group_members(gitea_api, members, group)
@@ -515,7 +547,7 @@ def _import_groups(gitea_api: pygitea, groups: [gitlab.v4.objects.Group]):
 
 def _import_group_members(gitea_api: pygitea, members: [gitlab.v4.objects.GroupMember], group: gitlab.v4.objects.Group):
     # TODO: create teams based on gitlab permissions (access_level of group member)
-    existing_teams = get_teams(gitea_api, name_clean(group.name))
+    existing_teams = get_teams(gitea_api, get_name_space(group.full_path))
     if existing_teams:
         first_team = existing_teams[0]
         print("Organization teams fetched, importing users to first team: " + first_team['name'])
@@ -525,11 +557,11 @@ def _import_group_members(gitea_api: pygitea, members: [gitlab.v4.objects.GroupM
             if not member_exists(gitea_api, member.username, first_team['id']):
                 import_response: requests.Response = gitea_api.put("/teams/" + str(first_team['id']) + "/members/" + member.username)
                 if import_response.ok:
-                    print_info("Member " + member.username + " added to group " + name_clean(group.name) + "!")
+                    print_info("Member " + member.username + " added to group " + get_name_space(group.full_path) + "!")
                 else:
-                    print_error("Failed to add member " + member.username + " to group " + name_clean(group.name) + "!")
+                    print_error("Failed to add member " + member.username + " to group " + get_name_space(group.full_path) + "!")
     else:
-        print_error("Failed to import members to group " + name_clean(group.name) + ": no teams found!")
+        print_error("Failed to import members to group " + get_name_space(group.full_path) + ": no teams found!")
 
 
 #
@@ -556,26 +588,30 @@ def import_projects(gitlab_api: gitlab.Gitlab, gitea_api: pygitea):
     projects: gitlab.v4.objects.Project = gitlab_api.projects.list(all=True)
 
     print("Found " + str(len(projects)) + " gitlab projects as user " + gitlab_api.user.username)
+    idx = 0
+    count = len(projects)
 
     for project in projects:
+        idx += 1
+        print(str(idx) + "/" + str(count) + "\t project.http_url_to_repo:" + project.http_url_to_repo + ", project.ssh_url_to_repo:" + project.ssh_url_to_repo)
         try:
             collaborators: [gitlab.v4.objects.ProjectMember] = project.members.list(all=True)
             labels: [gitlab.v4.objects.ProjectLabel] = project.labels.list(all=True)
             milestones: [gitlab.v4.objects.ProjectMilestone] = project.milestones.list(all=True)
             issues: [gitlab.v4.objects.ProjectIssue] = project.issues.list(all=True)
 
-            print("Importing project " + name_clean(project.name) + " from owner " + name_clean(project.namespace['name']))
-            print("Found " + str(len(collaborators)) + " collaborators for project " + name_clean(project.name))
-            print("Found " + str(len(labels)) + " labels for project " + name_clean(project.name))
-            print("Found " + str(len(milestones)) + " milestones for project " + name_clean(project.name))
-            print("Found " + str(len(issues)) + " issues for project " + name_clean(project.name))
+            print("Importing project " + name_clean(project.path) + " from owner " + get_name_space(project.namespace['full_path']))
+            print("Found " + str(len(collaborators)) + " collaborators for project " + name_clean(project.path))
+            print("Found " + str(len(labels)) + " labels for project " + name_clean(project.path))
+            print("Found " + str(len(milestones)) + " milestones for project " + name_clean(project.path))
+            print("Found " + str(len(issues)) + " issues for project " + name_clean(project.path))
 
         except Exception as e:
-            print("This project failed: \n {}, \n reason {}: ".format(project.name, e))
-        
+            print_error("This project failed: \n {}, \n reason {}: ".format(project.name, e))
+
         else:
-            projectOwner = name_clean(project.namespace['name'])
-            projectName = name_clean(project.name)
+            projectOwner = get_name_space(project.namespace['full_path'])
+            projectName = name_clean(project.path)
 
             # import project repo
             _import_project_repo(gitea_api, project)
@@ -635,6 +671,10 @@ def print_error(message):
     GLOBAL_ERROR_COUNT += 1
     print_color(bcolors.FAIL, message)
 
+
+# gitea中没有二级组织，因此，需要把二级组织改为一级组织
+def get_name_space(full_path):
+    return full_path.replace("/", "_")
 
 def name_clean(name):
     newName = name.replace(" ", "_")
