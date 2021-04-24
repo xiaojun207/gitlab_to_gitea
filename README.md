@@ -9,10 +9,10 @@ This script support migrating the following data:
  - Labels
  - Issues (no comments)
  - Users (no profile pictures)
- - Groups
+ - Groups (gitea中没有二级组织，因此，导入的时候，会把二级组织合并为一级组织，如：aa/bb ==> aa_bb)
  - Public SSH keys
 
-Tested with Gitlab Version 13.0.6 and Gitea Version 1.11.6.
+Tested with Gitlab Version 13.0.6-ce and Gitea Version 1.15.0.
 
 ## Usage
 Change items in the config section of the script.
