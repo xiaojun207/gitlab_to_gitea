@@ -12,6 +12,8 @@ This script support migrating the following data:
  - Groups (gitea中没有二级组织，因此，导入的时候，会把二级组织合并为一级组织，如：aa/bb ==> aa_bb)
  - Public SSH keys
 
+Repositories导入时，可设置UPDATE_PROJECT=True,删除旧的。默认UPDATE_PROJECT=False
+
 Tested with Gitlab Version 13.0.6-ce and Gitea Version 1.15.0.
 
 ## Usage
